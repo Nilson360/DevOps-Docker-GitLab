@@ -1,0 +1,145 @@
+workflow:
+  rules:
+    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH
+      variables:
+        MY_IMAGE: "$CI_REGISTRY_IMAGE" # Override globally-defined DEPLOY_VARIABLE
+    - when: always # Run the pipeline in other cases
+
+stages:
+  - linting
+  - prepare
+  - build
+  - security
+  - deploy
+
+variables:
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_TLS_CERTDIR: ""
+  MY_IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+  SERVER_FQDN: $SERVER_IP.nip.io
+
+services:
+  - docker:20.10-dind
+
+image: docker:20.10
+
+markdownlint:
+  stage: linting
+  only:
+    changes:
+      - docs/*.md
+  image: registry.gitlab.com/pipeline-components/markdownlint:latest
+  script:
+    - mdl --style all --warnings docs
+
+hadolint:
+  stage: linting
+  image: registry.gitlab.com/pipeline-components/hadolint:latest
+  only:
+    changes:
+      - Dockerfile
+  script:
+    - hadolint Dockerfile
+
+yamllint:
+  stage: linting
+  image: python:latest
+  only:
+    changes:
+      - mkdocs.yml
+  script:
+    - pip install yamllint
+    - yamllint mkdocs.yml
+
+build_public:
+  stage: prepare
+  image: python:latest
+  script:
+    - pip install mkdocs-material
+    - mkdocs build --site-dir public
+  artifacts:
+    paths:
+      - public
+
+build:
+  stage: build
+  tags:
+    - docker
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -t $MY_IMAGE .
+    - docker push $MY_IMAGE
+
+container_scanning_master:
+  stage: security
+  allow_failure: true
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "schedule"
+  script:
+    - docker run -d --name db arminc/clair-db:latest
+    - docker run -p 6060:6060 --link db:postgres -d --name clair --restart on-failure arminc/clair-local-scan:v2.0.6
+    - apk add -U wget ca-certificates
+    - docker pull "$MY_IMAGE"
+    - wget https://github.com/arminc/clair-scanner/releases/download/v8/clair-scanner_linux_amd64
+    - mv clair-scanner_linux_amd64 clair-scanner
+    - chmod +x clair-scanner
+    - touch clair-whitelist.yml
+    - while( ! wget -q -O /dev/null http://docker:6060/v1/namespaces ) ; do sleep 1 ; done
+    - retries=0
+    - echo "Waiting for clair daemon to start"
+    - while( ! wget -T 10 -q -O /dev/null http://docker:6060/v1/namespaces ) ; do sleep 1 ; echo -n "." ; if [ $retries -eq 10 ] ; then echo " Timeout, aborting." ; exit 1 ; fi ; retries=$(($retries+1)) ; done
+    - ./clair-scanner -c http://docker:6060 --ip $(hostname -i) -r gl-container-scanning-report.json -l clair.log -w clair-whitelist.yml ${MY_IMAGE}
+  artifacts:
+    reports:
+      container_scanning: gl-container-scanning-report.json
+
+deploy_review:
+  stage: deploy
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  environment:
+    name: review/$CI_COMMIT_REF_SLUG
+    url: http://$CI_COMMIT_REF_SLUG.$SERVER_IP.nip.io
+    on_stop: stop_review
+  script:
+    - chmod 600 $OUTSCALE_RSA_KEY
+    - ssh -oStrictHostKeyChecking=no -i $OUTSCALE_RSA_KEY outscale@$SERVER_FQDN "docker rm -f $CI_COMMIT_REF_SLUG || true"
+    - ssh -oStrictHostKeyChecking=no -i $OUTSCALE_RSA_KEY outscale@$SERVER_FQDN "docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY"
+    - ssh -oStrictHostKeyChecking=no -i $OUTSCALE_RSA_KEY outscale@$SERVER_FQDN "docker run --name $CI_COMMIT_REF_SLUG -d -e VIRTUAL_HOST=$CI_COMMIT_REF_SLUG.$SERVER_FQDN $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG"
+  except:
+    - main
+    - master
+
+stop_review:
+  stage: deploy
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - chmod 600 $OUTSCALE_RSA_KEY
+    - ssh -oStrictHostKeyChecking=no -i $OUTSCALE_RSA_KEY outscale@$SERVER_FQDN "docker rm -f $CI_COMMIT_REF_SLUG"
+  when: manual
+  environment:
+    name: review/$CI_COMMIT_REF_SLUG
+    action: stop
+  except:
+    - main
+    - master
+
+pages:
+  stage: deploy
+  image: python:latest
+  environment:
+    name: Production
+    url: https://hexagone-it3-versailles-2022.gitlab.io/documentation/
+  only:
+    - master
+    - main
+  script:
+    - pip install mkdocs-material
+    - mkdocs build --site-dir public
+  artifacts:
+    paths:
+      - public
